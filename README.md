@@ -503,9 +503,8 @@ All numbers come from the **synthetic** archive (60 sites, seed 42, 27,410 measu
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **25 passed**, 1 skipped (`pyproj` absent) | `pytest -q` |
-| Unit tests with `pyproj` | The skipped test also passes | `pip install -e ".[dev,geo]"` |
-| Expected CI (fresh venv, `pip install -e ".[dev]"`) | **25 passed**, 1 skipped | `.github/workflows/ci.yml` |
+| Unit tests (CI installs only `.[dev]`) | **25 passed**, 1 skipped (`pyproj` absent) | `pytest -q` |
+| Unit tests with `pyproj` | **26 passed** | `pip install -e ".[dev,geo]"`, `pytest -q` |
 | Ammonia, 3-day rain (true 0.03) | 0.0287 [0.0255, 0.0319] | `riverpulse demo` |
 | Orthophosphate, 7-day rain (true 0.012) | 0.0120 [0.0101, 0.0139] | `riverpulse demo` |
 | Dissolved oxygen, air temperature (true −0.22) | −0.2218 [−0.2293, −0.2143] | `riverpulse demo` |
