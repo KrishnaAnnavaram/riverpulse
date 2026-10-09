@@ -258,25 +258,38 @@ Each coefficient has a 95 % interval with standard errors clustered by site. The
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    RAW["Archive rows"] --> MAP["Determinand code or text to project name"]
+flowchart TD
+    SRC{"Data source"} -- "--csv" --> CSV[/"EA archive CSV files"/]
+    SRC -- "default" --> SYN["make_archive: synthetic sites"]
+    CSV --> RAW["Archive rows"]
+    SYN --> RAW
+    RAW --> MAP["Determinand code or text to project name"]
     MAP --> UNIT["Unit to mg/l, LOD policy"]
     UNIT --> QA["Drop impossible values, median of repeated values"]
     QA --> TIDY["Tidy table"]
     TIDY --> VIS["Visits: one row for each site and time"]
     VIS --> GEO["BNG to WGS84, grid cell"]
     GEO --> WX["Weather provider and rain windows"]
+    WSRC{"--weather"} -- "synthetic" --> WX
+    WSRC -- "open-meteo" --> CACHE[("Weather cache<br/>data/weather_cache")]
+    CACHE --> WX
+    WSRC -- "stations" --> STN[/"Station CSV files"/]
+    STN --> WX
     WX --> V2["Visits with weather"]
     V2 --> IDX["CCME index for each site and year"]
     V2 --> WE["Weather effects for each determinand"]
     V2 --> BP["Balanced panel"] --> ITS["Interrupted time series"]
     V2 --> NV["Naive phase means (comparison only)"]
     V2 --> FC["Forecast with temporal split"]
-    IDX --> REP["study.md and study.json"]
+    IDX --> REP[/"study.md and study.json"/]
     WE --> REP
     ITS --> REP
     NV --> REP
     FC --> REP
+    REP --> HUMAN{{"HUMAN<br/>reader compares the time series<br/>with the naive phase means"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one measurement
