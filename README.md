@@ -70,6 +70,7 @@ This README is the **one location that explains all of riverpulse**. It gives th
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one measurement](#42-the-life-cycle-of-one-measurement)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📥 [Ingest and units](#5-ingest-and-units)
 6. 🌦️ [Weather linkage](#6-weather-linkage)
 7. ⚖️ [The water-quality index](#7-the-water-quality-index)
@@ -145,6 +146,49 @@ flowchart LR
 | Study | `src/riverpulse/study.py` | Full study, text output, report files |
 | CLI | `src/riverpulse/cli.py` | The `riverpulse` command with 8 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry point"]
+        CLI["cli.py<br/>riverpulse command"]
+        CFG["config.py<br/>load_dotenv, Settings.from_env"]
+    end
+    subgraph DATAIN["Data in"]
+        SYN["synthetic.py<br/>make_archive"]
+        ING["ingest.py<br/>tidy, visits, sampling_summary"]
+        UNI["units.py<br/>canonical_name, to_mg_per_l"]
+        WX["weather.py<br/>providers, site_weather"]
+        GEO["geo.py<br/>bng_to_wgs84, grid_cell"]
+    end
+    subgraph STUDYG["Study"]
+        ST["study.py<br/>prepare, run_study, write_report"]
+        WQI["wqi.py<br/>ccme_by, exceedances"]
+        ANA["analysis.py<br/>weather_effects, covid_its"]
+        FC["forecast.py<br/>forecast"]
+        STA["stats.py<br/>ols_cluster, seasonal_terms"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI -- "ingest" --> ING
+    CLI --> WX
+    CLI --> ST
+    CLI -- "index, covid,<br/>weather-effects, forecast" --> ANA
+    ST --> ING
+    ST --> WX
+    ST --> WQI
+    ST --> ANA
+    ST --> FC
+    ING --> UNI
+    WX --> GEO
+    SYN --> GEO
+    SYN --> WX
+    ANA --> STA
+    FC --> STA
+    FC --> UNI
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -180,6 +224,17 @@ riverpulse/
 
 ### 3.1 The models explain determinands, not the index
 The index is a fixed function of the determinands. A model that predicts the index from the same determinands only learns the formula. riverpulse models each determinand from the season, the weather and the site. `forecast` refuses a target that is not a determinand.
+
+```mermaid
+flowchart LR
+    IN[/"Visits: determinands,<br/>weather, season, site"/] --> IDX["wqi.ccme: a fixed formula<br/>of the determinands"]
+    IDX --> SUMM[/"Index: a summary only,<br/>no model predicts it"/]
+    IN --> MOD["weather_effects, covid_its:<br/>y is one determinand"]
+    MOD --> COEF[/"Coefficients with 95 % intervals"/]
+    IN --> FT{"forecast target<br/>in VALID_RANGES?"}
+    FT -- "yes, a determinand" --> FC["forecast: test MAE<br/>against climatology"]
+    FT -- "no, for example the index" --> ERR[/"ValueError"/]
+```
 
 ### 3.2 A period comparison uses the same sites
 `balanced_panel` keeps only sites with at least `RIVERPULSE_MIN_SAMPLES` measurements in each period. The interrupted time series has a site effect, a trend and a season. The report also shows the naive phase means, so the reader can see the difference.
@@ -226,6 +281,36 @@ flowchart TB
 
 ### 4.2 The life cycle of one measurement
 
+```mermaid
+stateDiagram-v2
+    state "Archive row" as Row
+    state "Named determinand" as Named
+    state "Value in mg/l" as Converted
+    state "Value with LOD flag" as Flagged
+    state "Checked value" as Checked
+    state "Tidy row, median of repeats" as Tidy
+    state "Cell of a visit" as InVisit
+    state "Visit with weather" as WithWeather
+    state "Dropped and counted" as Dropped
+    [*] --> Row: read_archive or make_archive
+    Row --> Dropped: determinand not used
+    Row --> Named: canonical_name
+    Named --> Dropped: qualifier is the greater-than sign
+    Named --> Converted: to_mg_per_l, unit known
+    Named --> Dropped: unknown unit
+    Converted --> Flagged: qualifier is the less-than sign
+    Converted --> Checked: no qualifier
+    Flagged --> Checked: half or lod policy
+    Flagged --> Dropped: drop policy
+    Checked --> Dropped: no date, or outside VALID_RANGES
+    Checked --> Tidy: tidy
+    Tidy --> InVisit: visits pivot, missing stays NaN
+    InVisit --> WithWeather: site_weather
+    WithWeather --> Used: index, weather model, COVID model, forecast
+    Used --> [*]
+    Dropped --> [*]
+```
+
 1. The archive row gives a site, a time, a determinand code, a result, a qualifier and a unit.
 2. `canonical_name` maps the code to a project name, for example `0111` to `ammonia_n`.
 3. `to_mg_per_l` converts the unit. A result with `<` gets half the LOD (default) and a flag.
@@ -234,11 +319,76 @@ flowchart TB
 6. `site_weather` adds the weather and the rain sums of the visit date.
 7. The analysis uses the value in the index, the weather model, the COVID model and the forecast.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor AN as Analyst
+    participant CLI as cli.py
+    participant ST as study.py
+    participant ING as ingest.py
+    participant WX as weather.py
+    participant OM as Open-Meteo archive API
+    participant ANA as wqi.py and analysis.py
+    participant FC as forecast.py
+    participant FS as reports folder
+
+    AN->>CLI: riverpulse study --csv files --weather open-meteo
+    CLI->>CLI: load_dotenv, Settings.from_env
+    CLI->>CLI: read the CSV files, make OpenMeteoProvider
+    CLI->>ST: prepare(raw, settings, provider)
+    ST->>ING: tidy(raw, lod_policy), then visits
+    ING-->>ST: tidy table, IngestReport, visits
+    ST->>WX: site_weather(visits, provider)
+    loop each grid cell
+        WX->>OM: daily weather, only if no cache file
+        OM-->>WX: JSON reply, saved in data/weather_cache
+    end
+    WX-->>ST: visits with weather and rain sums
+    ST->>ST: exceedances
+    CLI->>ST: run_study(prep, settings)
+    ST->>ANA: ccme_by site and year
+    loop ammonia_n, orthophosphate_p, do_mg
+        ST->>ANA: weather_effects, covid_its, naive_phase_means
+    end
+    ST->>FC: forecast(do_mg)
+    CLI->>ST: write_report(result, out, source)
+    ST->>FS: study.md and study.json
+    CLI-->>AN: printed results and the two paths
+```
+
 ---
 
 ## 5. Ingest and units
 
 **Purpose.** Change the archive rows into one clean measurement for each site, time and determinand.
+
+```mermaid
+flowchart TD
+    IN[/"EA archive CSV rows"/] --> COLS{"All 9 EA columns present?"}
+    COLS -- "no" --> ERR[/"IngestError"/]
+    COLS -- "yes" --> MAP{"canonical_name: known code<br/>or definition text?"}
+    MAP -- "no" --> DROP["Drop the row, count the<br/>reason in IngestReport"]
+    MAP -- "yes" --> Q{"Qualifier is the<br/>greater-than sign?"}
+    Q -- "yes" --> DROP
+    Q -- "no" --> UNIT{"to_mg_per_l: unit known?"}
+    UNIT -- "no" --> DROP
+    UNIT -- "yes" --> LOD{"Qualifier is the less-than sign:<br/>RIVERPULSE_LOD_POLICY"}
+    LOD -- "half" --> HALF["value = LOD / 2,<br/>below_lod flag"]
+    LOD -- "lod" --> KEEP["value = LOD,<br/>below_lod flag"]
+    LOD -- "drop" --> DROP
+    LOD -- "no qualifier" --> TIME
+    HALF --> TIME{"Date and numeric<br/>result present?"}
+    KEEP --> TIME
+    TIME -- "no" --> DROP
+    TIME -- "yes" --> RNG{"Inside VALID_RANGES?"}
+    RNG -- "no" --> DROP
+    RNG -- "yes" --> MED["Median of repeated values for<br/>one site, time and determinand"]
+    MED --> TIDY[/"Tidy table and IngestReport"/]
+    TIDY --> VIS["visits: one row for each site and time,<br/>missing stays NaN"]
+    VIS --> SUM[/"sampling_summary:<br/>visits and sites for each year"/]
+```
 
 | LOD policy (`RIVERPULSE_LOD_POLICY`) | Value of a `<` result |
 |---|---|
@@ -251,7 +401,8 @@ flowchart TB
 | `mg/l` | 1 |
 | `ug/l`, `µg/l` | 0.001 |
 | `ng/l` | 0.000001 |
-| `phunits`, `cel`, `%` | 1 (no conversion) |
+| `g/l` | 1000 |
+| `phunits`, `unitless`, `cel`, `degc`, `%` | 1 (no conversion) |
 
 | Determinand | Valid range |
 |---|---|
@@ -261,6 +412,8 @@ flowchart TB
 | `nitrate_n` | 0 to 200 mg/l |
 | `orthophosphate_p` | 0 to 100 mg/l |
 | `do_mg` | 0 to 25 mg/l |
+| `do_sat` | 0 to 250 % |
+| `bod` | 0 to 500 mg/l |
 
 **Rules**
 
@@ -273,6 +426,33 @@ flowchart TB
 ## 6. Weather linkage
 
 **Purpose.** Give each visit the weather of its own place and the rain before the visit.
+
+```mermaid
+flowchart TD
+    V[/"Visits with easting and northing"/] --> SITES["One row for each site,<br/>sites without coordinates left out"]
+    SITES --> PJ{"use_pyproj and<br/>pyproj installed?"}
+    PJ -- "yes" --> PYP["pyproj: EPSG:27700<br/>to EPSG:4326"]
+    PJ -- "no" --> OS["bng_to_osgb36, then the<br/>Helmert osgb36_to_wgs84"]
+    PYP --> CELL["grid_cell: centre of<br/>the 0.1-degree cell"]
+    OS --> CELL
+    CELL --> SPAN["Date span: 20 days before<br/>the first visit to the last visit"]
+    SPAN --> PROV{"--weather provider,<br/>one call for each cell"}
+    PROV -- "synthetic" --> SW["SyntheticWeather:<br/>seeded series, sliced"]
+    PROV -- "open-meteo" --> CACHE{"Cache file exists?"}
+    CACHE -- "yes" --> RJ["Read the JSON file"]
+    CACHE -- "no" --> API["Call the Open-Meteo<br/>archive API, save the JSON"]
+    PROV -- "stations" --> NEAR{"Nearest station within<br/>RIVERPULSE_MAX_STATION_KM?"}
+    NEAR -- "yes" --> STN["Station rows of the span"]
+    NEAR -- "no" --> EMPTY["No rows:<br/>weather stays missing"]
+    SW --> RAIN["add_rain_windows:<br/>rain_1d, rain_3d, rain_7d, rain_14d"]
+    RJ --> RAIN
+    API --> RAIN
+    STN --> RAIN
+    EMPTY --> RAIN
+    RAIN --> JOIN[/"Left join to the visits on<br/>site and date, plus lat and lon"/]
+```
+
+The CLI sets `use_pyproj` only for archive files from `--csv`. The synthetic archive always uses the numpy conversion, because the generator uses it to choose the cells.
 
 **Procedure**
 
@@ -293,6 +473,27 @@ flowchart TB
 ## 7. The water-quality index
 
 **Purpose.** Give a summary of water quality for a site and a year.
+
+```mermaid
+flowchart TD
+    IN[/"Visits of one group:<br/>one site in one year"/] --> COLS["Determinands in OBJECTIVES<br/>with at least one value"]
+    COLS --> MIN{"4 or more determinands<br/>and 4 or more tests?"}
+    MIN -- "no" --> INS[/"wqi NaN,<br/>insufficient data"/]
+    MIN -- "yes" --> EXC{"Each test against<br/>its objective"}
+    EXC -- "above the maximum" --> X1["excursion =<br/>value / objective - 1"]
+    EXC -- "below the minimum" --> X2["excursion =<br/>objective / value - 1"]
+    EXC -- "inside" --> X0["excursion = 0, pass"]
+    X1 --> F["F1: % of determinands that fail<br/>F2: % of tests that fail<br/>F3: nse / (0.01 nse + 0.01)"]
+    X2 --> F
+    X0 --> F
+    F --> WQI["100 - √(F1² + F2² + F3²) / 1.732,<br/>clipped to 0 to 100"]
+    WQI --> CAT{"category"}
+    CAT -- "95 or more" --> C1[/"excellent"/]
+    CAT -- "80 to below 95" --> C2[/"good"/]
+    CAT -- "65 to below 80" --> C3[/"fair"/]
+    CAT -- "45 to below 65" --> C4[/"marginal"/]
+    CAT -- "below 45" --> C5[/"poor"/]
+```
 
 | Determinand | Objective | Type |
 |---|---|---|
@@ -327,6 +528,20 @@ A group with fewer than 4 determinands or 4 measurements gets "insufficient data
 
 **Purpose.** Measure how temperature and rain change each determinand.
 
+```mermaid
+flowchart TD
+    IN[/"Visits with weather,<br/>one determinand"/] --> NA["Keep rows with the determinand,<br/>tmean, rain_3d, rain_7d, rain_14d"]
+    NA --> MIN{"3 or more sites and<br/>50 or more rows?"}
+    MIN -- "no" --> ERR[/"ValueError: too few rows,<br/>the study keeps the error text"/]
+    MIN -- "yes" --> X["X: weather terms and seasonal_terms<br/>sin1, cos1, sin2, cos2"]
+    X --> RESP{"Determinand in<br/>LOG_DETERMINANDS?"}
+    RESP -- "yes" --> LOG["y = natural log of the value,<br/>value clipped at 1e-4"]
+    RESP -- "no" --> RAW["y = raw value"]
+    LOG --> OLS["ols_cluster: site fixed effects,<br/>clusters by site"]
+    RAW --> OLS
+    OLS --> TAB[/"Rows for tmean, rain_3d, rain_7d, rain_14d:<br/>coef, se, 95 % interval, p-value, n, sites"/]
+```
+
 **Model.** `y = site effect + 2 season harmonics + b1 tmean + b2 rain_3d + b3 rain_7d + b4 rain_14d + error`.
 
 | Rule | Value |
@@ -338,11 +553,46 @@ A group with fewer than 4 determinands or 4 measurements gets "insufficient data
 
 For a log response, 100 × b is about the percent change for one unit of the weather term.
 
+The diagram shows `ols_cluster` in `stats.py`. The weather model and the COVID model both use it.
+
+```mermaid
+flowchart TD
+    IN[/"y, X, clusters,<br/>fixed effects"/] --> FE{"Fixed effects given?"}
+    FE -- "yes" --> DUM["One dummy column for each site,<br/>no intercept"]
+    FE -- "no" --> INT["Add an intercept column"]
+    DUM --> Z["Z: X and the added columns"]
+    INT --> Z
+    Z --> KEEP["Keep the rows with finite y and Z"]
+    KEEP --> BETA["beta = pinv(Z'Z) Z'y"]
+    BETA --> MEAT["Meat: sum over the sites of<br/>the outer product of the scores"]
+    MEAT --> CR1["CR1 scale:<br/>G / (G - 1) × (n - 1) / (n - k)"]
+    CR1 --> SE["Sandwich covariance,<br/>standard errors of the X terms"]
+    SE --> OUT[/"OLSResult.table: coef, se,<br/>coef ± 1.96 se, normal p-value"/]
+```
+
 ---
 
 ## 9. The COVID effect
 
 **Purpose.** Estimate the change of a determinand during and after the restrictions, with the same sites in each period.
+
+```mermaid
+flowchart TD
+    IN[/"Visits with weather,<br/>one determinand"/] --> PER["assign_period: before, during, after<br/>from COVID_START and COVID_END"]
+    PER --> BAL["balanced_panel: sites with MIN_SAMPLES<br/>or more measurements in each period"]
+    PER --> NAIVE[/"naive_phase_means:<br/>all visits, no site matching"/]
+    BAL --> N3{"3 or more sites<br/>in the panel?"}
+    N3 -- "no" --> ERR[/"ValueError,<br/>the study keeps the error text"/]
+    N3 -- "yes" --> X["X: trend_years from COVID_START,<br/>during, after, 2 season harmonics"]
+    X --> OLS["ols_cluster with site fixed effects,<br/>clusters by site"]
+    OLS --> LOGQ{"Log response?"}
+    LOGQ -- "yes" --> PCT["coef and interval in percent:<br/>100 × (exp(b) - 1)"]
+    LOGQ -- "no" --> UNITS["coef and interval in units"]
+    PCT --> OUT[/"trend_years, during, after,<br/>sites_in_panel of sites_total"/]
+    UNITS --> OUT
+    OUT --> REP[/"Report: the model and the<br/>naive means side by side"/]
+    NAIVE --> REP
+```
 
 | Period | Dates (default) |
 |---|---|
@@ -364,6 +614,26 @@ For a log response, 100 × b is about the percent change for one unit of the wea
 
 **Purpose.** An optional machine-learning check: forecast one determinand (default `do_mg`) for later visits.
 
+```mermaid
+flowchart TD
+    IN[/"Visits with weather, target,<br/>cutoff 2021-12-31"/] --> T{"Target in VALID_RANGES?"}
+    T -- "no" --> ERR[/"ValueError"/]
+    T -- "yes" --> NA["Keep rows with the target,<br/>tmean and rain_14d"]
+    NA --> SPLIT["Temporal split: train up to the cutoff,<br/>test after the cutoff"]
+    SPLIT --> SZ{"train 100 or more rows and<br/>test 20 or more rows?"}
+    SZ -- "no" --> ERR
+    SZ -- "yes" --> FEAT["Features: tmean, rain sums,<br/>season harmonics, site_mean of train"]
+    FEAT --> HGB["HistGradientBoostingRegressor<br/>max_iter 200, learning_rate 0.05"]
+    HGB --> M1["Test MAE of the model"]
+    SZ -- "yes" --> CLIM["Climatology: train mean of the site and month,<br/>else of the site, else of all rows"]
+    CLIM --> M2["Test MAE of the baseline"]
+    FEAT --> GKF["GroupKFold, 5 folds by site on train:<br/>an unseen site gets the global mean"]
+    GKF --> M3["Grouped CV MAE, unseen sites"]
+    M1 --> OUT[/"forecast result"/]
+    M2 --> OUT
+    M3 --> OUT
+```
+
 | Item | Value |
 |---|---|
 | Split | Train on visits up to the cut-off date (default 2021-12-31), test on later visits |
@@ -377,6 +647,26 @@ For a log response, 100 × b is about the percent change for one unit of the wea
 ## 11. The synthetic archive
 
 **Purpose.** Give the demo and the tests an archive with known effects and the defects of the real archive.
+
+```mermaid
+flowchart TD
+    IN[/"n_sites 60, seed,<br/>2015 to 2024, COVID dates"/] --> SITES["Sites: random BNG coordinates and<br/>site levels of ammonia, phosphate,<br/>nitrate, oxygen, pH"]
+    SITES --> CELL["bng_to_wgs84 with numpy, grid_cell"]
+    CELL --> WX["SyntheticWeather and add_rain_windows<br/>for each cell"]
+    WX --> MONTH["For each site and month"]
+    MONTH --> COV{"Month inside<br/>the COVID dates?"}
+    COV -- "yes" --> PLOW["Visit chance 0.05 to 0.60,<br/>higher for cleaner sites"]
+    COV -- "no" --> PHIGH["Visit chance 0.8"]
+    PLOW --> VISIT{"Visit drawn?"}
+    PHIGH --> VISIT
+    VISIT -- "no" --> MONTH
+    VISIT -- "yes" --> VAL["Values from TRUTH: season, trend,<br/>rain, COVID and temperature effects"]
+    VAL --> SPIKE["Ammonia spike × 5<br/>in 1 % of visits"]
+    SPIKE --> MISS{"Determinand measured?<br/>88 % chance"}
+    MISS -- "no" --> SKIP["No row"]
+    MISS -- "yes" --> DEF["Ammonia below 0.03: result 0.03<br/>with the less-than qualifier,<br/>20 % of orthophosphate in ug/l"]
+    DEF --> ROW[/"One row in the EA archive format"/]
+```
 
 | Item | Value in `make_archive` |
 |---|---|
@@ -461,6 +751,23 @@ riverpulse study --csv data/CB-*.csv --weather stations \
 | `forecast` | Prints the forecast scores |
 | `study` | Runs everything and writes `study.md` and `study.json` |
 
+The diagram shows the order of the commands and the files that connect them. The analysis commands do not read `data/tidy.csv`. They read the archive files from `--csv` again, or make the synthetic archive in memory.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> GEN["riverpulse generate"]
+    GEN --> ARC[("data/synthetic_archive.csv")]
+    EA[("EA archive CSV files")] --> ING["riverpulse ingest"]
+    ARC --> ING
+    ING --> TIDY[("data/tidy.csv")]
+    ARC -- "--csv" --> AN["index, weather-effects,<br/>covid, forecast, study"]
+    EA -- "--csv" --> AN
+    MEM["No --csv:<br/>make_archive in memory"] --> AN
+    AN -- "index --out" --> IDX[("reports/index.csv")]
+    AN -- "study" --> REP[("reports/study.md,<br/>reports/study.json")]
+    INS --> DEMO["riverpulse demo<br/>prints only, writes no files"]
+```
+
 ### 13.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -475,6 +782,16 @@ riverpulse study --csv data/CB-*.csv --weather stations \
 | `RIVERPULSE_COVID_END` | COVID analysis | End of the restrictions. Default 2021-07-19 |
 
 The CLI reads a local `.env` file. A variable that is already in the environment wins. A value that is not valid stops the command with `error:`. riverpulse needs no credentials.
+
+```mermaid
+flowchart LR
+    DOT[/".env file"/] --> LD["load_dotenv:<br/>sets only absent variables"]
+    PENV[/"Process environment"/] --> FE["Settings.from_env"]
+    LD --> FE
+    FE --> CHK{"Numbers and dates valid,<br/>LOD policy known,<br/>COVID_START before COVID_END,<br/>MAX_STATION_KM above 0,<br/>MIN_SAMPLES 1 or more?"}
+    CHK -- "yes" --> SET[/"Settings"/]
+    CHK -- "no" --> ERR[/"ConfigError: the CLI prints<br/>error: and returns 1"/]
+```
 
 ---
 
